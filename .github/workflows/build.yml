@@ -1,40 +1,62 @@
-name: Build NDK project and send to Telegram
+name: Build JNI plugin
 
 on:
-  workflow_dispatch:
-    inputs:
-      chat_id:
-        description: "Telegram chat_id, куда отправить результат"
-        required: true
-        type: string
+  repository_dispatch:
+    types: [build]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout репозитория (скелет проекта: Android.mk, vendor/Dobby и т.д.)
         uses: actions/checkout@v4
 
-      - name: Unpack project.zip
+      - name: Скачать NDK r25c
         run: |
-          mkdir -p project
-          unzip -o project.zip -d project
+          wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          unzip -q android-ndk-r25c-linux.zip -d $HOME
+          echo "NDK_HOME=$HOME/android-ndk-r25c" >> $GITHUB_ENV
 
-      - name: Locate Android.mk anywhere in archive
-        id: locate
+      - name: Скачать и наложить .cpp файлы пользователя поверх jni/
+        env:
+          ARCHIVE_URL: ${{ github.event.client_payload.archive_url }}
         run: |
-          ANDROID_MK=$(find project -type f -iname "Android.mk" | head -n1)
-          if [ -z "$ANDROID_MK" ]; then
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          curl -L "$ARCHIVE_URL" -o source.zip
+          # -o перезаписывает совпадающие файлы, остальной скелет (vendor/Dobby и т.п.) остаётся нетронутым
+          unzip -o -q source.zip -d jni
 
-          JNI_DIR=$(dirname "$ANDROID_MK")
-          PROJECT_ROOT=$(dirname "$JNI_DIR")
-          APPLICATION_MK="$JNI_DIR/Application.mk"
-          [ -f "$APPLICATION_MK" ] || APPLICATION_MK=""
+      - name: Собрать ndk-build
+        run: |
+          $NDK_HOME/ndk-build \
+            NDK_PROJECT_PATH="$GITHUB_WORKSPACE" \
+            APP_BUILD_SCRIPT="$GITHUB_WORKSPACE/jni/Android.mk" \
+            NDK_APPLICATION_MK="$GITHUB_WORKSPACE/jni/Application.mk" \
+            -j4
 
-          echo "found=true" >> "$GITHUB_OUTPUT"
+      - name: Упаковать libs.zip
+        run: |
+          cd libs
+          zip -r "$GITHUB_WORKSPACE/libs.zip" armeabi-v7a arm64-v8a
+
+      - name: Отправить результат в Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -F document=@libs.zip \
+               -F chat_id="$CHAT_ID" \
+               -F caption="Сборка готова: libplugin.so для armeabi-v7a и arm64-v8a" \
+               "https://api.telegram.org/bot$BOT_TOKEN/sendDocument"
+
+      - name: Уведомить об ошибке (если сборка упала)
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          curl -F chat_id="$CHAT_ID" \
+               -F text="Сборка не удалась. Проверьте .cpp файлы в архиве и логи в GitHub Actions." \
+               "https://api.telegram.org/bot$BOT_TOKEN/sendMessage"          echo "found=true" >> "$GITHUB_OUTPUT"
           echo "android_mk=$ANDROID_MK" >> "$GITHUB_OUTPUT"
           echo "jni_dir=$JNI_DIR" >> "$GITHUB_OUTPUT"
           echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
