@@ -1,0 +1,78 @@
+name: Build NDK project and send to Telegram
+
+on:
+  workflow_dispatch:
+    inputs:
+      chat_id:
+        description: "Telegram chat_id, куда отправить результат"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Unpack project.zip
+        run: |
+          mkdir -p project
+          unzip -o project.zip -d project
+
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
+      - name: Run ndk-build
+        working-directory: project
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          "$ANDROID_NDK_HOME/ndk-build" -j$(nproc)
+
+      - name: Collect .so files
+        id: collect
+        working-directory: project
+        run: |
+          mkdir -p /tmp/out
+          find libs -name "*.so" -exec cp {} /tmp/out/ \;
+          cd /tmp/out
+          if [ -z "$(ls -A .)" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            zip -r /tmp/result.zip .
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload artifact (backup)
+        if: steps.collect.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-so
+          path: /tmp/out/*.so
+
+      - name: Send result to Telegram (success)
+        if: success() && steps.collect.outputs.found == 'true'
+        run: |
+          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
+               -F document=@/tmp/result.zip \
+               -F caption="Сборка готова ✅" \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument"
+
+      - name: Notify no .so found
+        if: success() && steps.collect.outputs.found == 'false'
+        run: |
+          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
+               -F text="Сборка прошла, но .so файлы не найдены в libs/. Проверь Android.mk/Application.mk." \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage"
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
+               -F text="Сборка упала ❌. Смотри лог: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage"
