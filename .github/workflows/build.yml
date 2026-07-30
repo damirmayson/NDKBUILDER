@@ -20,7 +20,81 @@ jobs:
           mkdir -p project
           unzip -o project.zip -d project
 
+      - name: Locate Android.mk anywhere in archive
+        id: locate
+        run: |
+          ANDROID_MK=$(find project -type f -iname "Android.mk" | head -n1)
+          if [ -z "$ANDROID_MK" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          JNI_DIR=$(dirname "$ANDROID_MK")
+          PROJECT_ROOT=$(dirname "$JNI_DIR")
+          APPLICATION_MK="$JNI_DIR/Application.mk"
+          [ -f "$APPLICATION_MK" ] || APPLICATION_MK=""
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "android_mk=$ANDROID_MK" >> "$GITHUB_OUTPUT"
+          echo "jni_dir=$JNI_DIR" >> "$GITHUB_OUTPUT"
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+          echo "application_mk=$APPLICATION_MK" >> "$GITHUB_OUTPUT"
+
+          echo "Найден Android.mk: $ANDROID_MK"
+          echo "jni/: $JNI_DIR"
+          echo "Корень проекта: $PROJECT_ROOT"
+          echo "Application.mk: ${APPLICATION_MK:-не найден, соберётся с настройками по умолчанию}"
+
+      - name: Notify Android.mk not found
+        if: steps.locate.outputs.found == 'false'
+        run: |
+          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
+               -F text="В архиве не найден jni/Android.mk. Проверь, что .zip содержит папку jni с Android.mk внутри." \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage"
+
+      - name: Validate LOCAL_SRC_FILES exist
+        id: validate
+        if: steps.locate.outputs.found == 'true'
+        run: |
+          ANDROID_MK="${{ steps.locate.outputs.android_mk }}"
+          JNI_DIR="${{ steps.locate.outputs.jni_dir }}"
+
+          # склеиваем строки с переносом "\" в одну, чтобы не терять
+          # многострочные LOCAL_SRC_FILES := a.cpp \  b.cpp \  ...
+          sed ':a;N;$!ba;s/\\\n[ \t]*/ /g' "$ANDROID_MK" > /tmp/android_mk_flat.txt
+
+          SRC_FILES=$(grep -E '^[[:space:]]*LOCAL_SRC_FILES[[:space:]]*(:=|\+=)' /tmp/android_mk_flat.txt \
+            | grep -oE '[A-Za-z0-9_./-]+\.(cpp|cc|cxx|c)\b' || true)
+
+          if [ -z "$SRC_FILES" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "missing=не удалось прочитать LOCAL_SRC_FILES из Android.mk" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MISSING=""
+          for f in $SRC_FILES; do
+            if [ ! -f "$JNI_DIR/$f" ]; then
+              MISSING="$MISSING $f"
+            fi
+          done
+
+          if [ -n "$MISSING" ]; then
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "missing=$MISSING" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify missing source files
+        if: steps.locate.outputs.found == 'true' && steps.validate.outputs.ok == 'false'
+        run: |
+          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
+               -F text="В Android.mk указаны файлы, которых нет в jni/: ${{ steps.validate.outputs.missing }}" \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage"
+
       - name: Set up NDK
+        if: steps.locate.outputs.found == 'true' && steps.validate.outputs.ok == 'true'
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
@@ -28,20 +102,30 @@ jobs:
           add-to-path: true
 
       - name: Run ndk-build
-        working-directory: project
+        id: build
+        if: steps.locate.outputs.found == 'true' && steps.validate.outputs.ok == 'true'
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          PROJECT_ROOT: ${{ steps.locate.outputs.project_root }}
+          ANDROID_MK: ${{ steps.locate.outputs.android_mk }}
+          APPLICATION_MK: ${{ steps.locate.outputs.application_mk }}
         run: |
-          "$ANDROID_NDK_HOME/ndk-build" -j$(nproc)
+          ARGS=(NDK_PROJECT_PATH="$PROJECT_ROOT" APP_BUILD_SCRIPT="$ANDROID_MK" -j"$(nproc)")
+          if [ -n "$APPLICATION_MK" ]; then
+            ARGS+=(NDK_APPLICATION_MK="$APPLICATION_MK")
+          fi
+          "$ANDROID_NDK_HOME/ndk-build" "${ARGS[@]}"
 
       - name: Collect .so files
         id: collect
-        working-directory: project
+        if: steps.locate.outputs.found == 'true' && steps.validate.outputs.ok == 'true'
+        env:
+          PROJECT_ROOT: ${{ steps.locate.outputs.project_root }}
         run: |
           mkdir -p /tmp/out
           # Копируем с сохранением структуры libs/<abi>/libplugin.so,
           # иначе одинаковые имена файлов из разных ABI затирают друг друга.
-          find libs -mindepth 2 -name "*.so" | while read -r f; do
+          find "$PROJECT_ROOT/libs" -mindepth 2 -name "*.so" | while read -r f; do
             abi_dir="/tmp/out/$(basename "$(dirname "$f")")"
             mkdir -p "$abi_dir"
             cp "$f" "$abi_dir/"
@@ -70,7 +154,7 @@ jobs:
                "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument"
 
       - name: Notify no .so found
-        if: success() && steps.collect.outputs.found == 'false'
+        if: success() && steps.locate.outputs.found == 'true' && steps.validate.outputs.ok == 'true' && steps.collect.outputs.found == 'false'
         run: |
           curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
                -F text="Сборка прошла, но .so файлы не найдены в libs/. Проверь Android.mk/Application.mk." \
@@ -82,21 +166,4 @@ jobs:
           curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
                -F text="Сборка упала ❌. Смотри лог: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
                "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage"
-          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
-               -F document=@/tmp/result.zip \
-               -F caption="Сборка готова ✅" \
-               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument"
-
-      - name: Notify no .so found
-        if: success() && steps.collect.outputs.found == 'false'
-        run: |
-          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
-               -F text="Сборка прошла, но .so файлы не найдены в libs/. Проверь Android.mk/Application.mk." \
-               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage"
-
-      - name: Notify failure
-        if: failure()
-        run: |
-          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
-               -F text="Сборка упала ❌. Смотри лог: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
                "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage"
