@@ -39,7 +39,13 @@ jobs:
         working-directory: project
         run: |
           mkdir -p /tmp/out
-          find libs -name "*.so" -exec cp {} /tmp/out/ \;
+          # Копируем с сохранением структуры libs/<abi>/libplugin.so,
+          # иначе одинаковые имена файлов из разных ABI затирают друг друга.
+          find libs -mindepth 2 -name "*.so" | while read -r f; do
+            abi_dir="/tmp/out/$(basename "$(dirname "$f")")"
+            mkdir -p "$abi_dir"
+            cp "$f" "$abi_dir/"
+          done
           cd /tmp/out
           if [ -z "$(ls -A .)" ]; then
             echo "found=false" >> "$GITHUB_OUTPUT"
@@ -58,6 +64,24 @@ jobs:
       - name: Send result to Telegram (success)
         if: success() && steps.collect.outputs.found == 'true'
         run: |
+          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
+               -F document=@/tmp/result.zip \
+               -F caption="Сборка готова ✅" \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument"
+
+      - name: Notify no .so found
+        if: success() && steps.collect.outputs.found == 'false'
+        run: |
+          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
+               -F text="Сборка прошла, но .so файлы не найдены в libs/. Проверь Android.mk/Application.mk." \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage"
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
+               -F text="Сборка упала ❌. Смотри лог: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage"
           curl -s -F chat_id="${{ github.event.inputs.chat_id }}" \
                -F document=@/tmp/result.zip \
                -F caption="Сборка готова ✅" \
